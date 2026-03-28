@@ -1,0 +1,41 @@
+"""Application settings and environment loading."""
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # optional dependency for first-run convenience
+    load_dotenv = None
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+ENV_PATH = BASE_DIR / ".env"
+
+if load_dotenv and ENV_PATH.exists():
+    load_dotenv(ENV_PATH)
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    """Centralized configuration object."""
+
+    app_name: str = "Desktop Algo Trader"
+    db_path: str = str(BASE_DIR / "data" / "trading_app.db")
+    log_file: str = str(BASE_DIR / "logs" / "app.log")
+
+    # Zerodha Kite Connect
+    kite_api_key: str = os.getenv("KITE_API_KEY", "")
+    kite_api_secret: str = os.getenv("KITE_API_SECRET", "")
+    kite_access_token: str = os.getenv("KITE_ACCESS_TOKEN", "")
+
+    # Telegram alerts (optional)
+    telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
+
+    default_symbols: tuple[str, ...] = ("NSE:NIFTY 50", "NSE:NIFTY BANK", "NSE:RELIANCE")
+    polling_interval_secs: int = int(os.getenv("POLLING_INTERVAL_SECS", "5"))
+
+
+CONFIG = AppConfig()
