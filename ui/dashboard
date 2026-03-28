@@ -1,0 +1,296 @@
+"""Main desktop dashboard for market watch, strategy, and order panes."""
+from __future__ import annotations
+
+from datetime import datetime
+
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.offline import plot
+from PyQt5.QtCore import QTimer
+from PyQt5.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QFileDialog,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+
+from broker.zerodha_api import ZerodhaAPI, ZerodhaAPIError
+from config.settings import CONFIG
+from services.trading_service import TradingService
+
+
+class DashboardWindow(QMainWindow):
+    def __init__(self, service: TradingService, logger) -> None:
+        super().__init__()
+        self.service = service
+        self.logger = logger
+        self.setWindowTitle("Desktop Algo Trader - Zerodha")
+        self.resize(1200, 760)
+
+        self.symbols = list(CONFIG.default_symbols)
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh_market)
+
+        container = QWidget()
+        self.setCentralWidget(container)
+        root = QGridLayout(container)
+
+        root.addWidget(self._broker_box(), 0, 0)
+        root.addWidget(self._strategy_box(), 0, 1)
+        root.addWidget(self._risk_box(), 0, 2)
+        root.addWidget(self._market_watch_box(), 1, 0, 1, 2)
+        root.addWidget(self._orders_box(), 1, 2)
+        root.addWidget(self._pnl_box(), 2, 0, 1, 3)
+
+    def _broker_box(self) -> QGroupBox:
+        box = QGroupBox("Broker Login (Kite Connect)")
+        layout = QVBoxLayout(box)
+
+        self.api_key_input = QLineEdit(CONFIG.kite_api_key)
+        self.api_secret_input = QLineEdit(CONFIG.kite_api_secret)
+        self.api_secret_input.setEchoMode(QLineEdit.Password)
+        self.request_token_input = QLineEdit()
+        self.access_token_input = QLineEdit(CONFIG.kite_access_token)
+
+        self.login_url_btn = QPushButton("Generate Login URL")
+        self.session_btn = QPushButton("Generate Access Token")
+        self.connect_btn = QPushButton("Connect Broker")
+
+        self.login_url_btn.clicked.connect(self.show_login_url)
+        self.session_btn.clicked.connect(self.generate_access_token)
+        self.connect_btn.clicked.connect(self.connect_broker)
+
+        for text, widget in [
+            ("API Key", self.api_key_input),
+            ("API Secret", self.api_secret_input),
+            ("Request Token", self.request_token_input),
+            ("Access Token", self.access_token_input),
+        ]:
+            row = QHBoxLayout()
+            row.addWidget(QLabel(text))
+            row.addWidget(widget)
+            layout.addLayout(row)
+
+        row = QHBoxLayout()
+        row.addWidget(self.login_url_btn)
+        row.addWidget(self.session_btn)
+        row.addWidget(self.connect_btn)
+        layout.addLayout(row)
+
+        self.profile_label = QLabel("Broker: Not connected")
+        layout.addWidget(self.profile_label)
+        return box
+
+    def _strategy_box(self) -> QGroupBox:
+        box = QGroupBox("Strategy Panel")
+        layout = QVBoxLayout(box)
+
+        self.strategy_combo = QComboBox()
+        self.strategy_combo.addItems(self.service.strategy_engine.available())
+        self.strategy_combo.currentTextChanged.connect(self._strategy_changed)
+
+        self.auto_toggle = QCheckBox("Enable Auto Trading")
+        self.auto_toggle.stateChanged.connect(lambda _: self.service.set_auto_trading(self.auto_toggle.isChecked()))
+
+        self.mode_toggle = QCheckBox("Live Trading Mode (unchecked = Paper)")
+        self.mode_toggle.stateChanged.connect(lambda _: self.service.set_mode(self.mode_toggle.isChecked()))
+
+        self.dark_mode_toggle = QCheckBox("Dark Mode")
+        self.dark_mode_toggle.stateChanged.connect(self.toggle_dark_mode)
+
+        self.qty_input = QLineEdit("1")
+
+        self.chart_btn = QPushButton("Open Last Candle Chart")
+        self.chart_btn.clicked.connect(self.show_plot)
+
+        layout.addWidget(QLabel("Strategy"))
+        layout.addWidget(self.strategy_combo)
+        layout.addWidget(QLabel("Order Quantity"))
+        layout.addWidget(self.qty_input)
+        layout.addWidget(self.auto_toggle)
+        layout.addWidget(self.mode_toggle)
+        layout.addWidget(self.dark_mode_toggle)
+        layout.addWidget(self.chart_btn)
+        return box
+
+    def _risk_box(self) -> QGroupBox:
+        box = QGroupBox("Risk Management")
+        layout = QVBoxLayout(box)
+        self.risk_text = QLabel(
+            "Stop Loss, Target, Trailing SL and max daily loss are enforced in service layer."
+        )
+        self.risk_text.setWordWrap(True)
+        layout.addWidget(self.risk_text)
+        return box
+
+    def _market_watch_box(self) -> QGroupBox:
+        box = QGroupBox("Live Market Watch")
+        layout = QVBoxLayout(box)
+
+        self.market_table = QTableWidget(0, 3)
+        self.market_table.setHorizontalHeaderLabels(["Symbol", "LTP", "Last Update"])
+
+        btn_row = QHBoxLayout()
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self.refresh_market)
+        start_btn = QPushButton("Start Auto Refresh")
+        stop_btn = QPushButton("Stop Auto Refresh")
+        start_btn.clicked.connect(lambda: self.timer.start(CONFIG.polling_interval_secs * 1000))
+        stop_btn.clicked.connect(self.timer.stop)
+        btn_row.addWidget(refresh_btn)
+        btn_row.addWidget(start_btn)
+        btn_row.addWidget(stop_btn)
+
+        layout.addWidget(self.market_table)
+        layout.addLayout(btn_row)
+        return box
+
+    def _orders_box(self) -> QGroupBox:
+        box = QGroupBox("Orders & Positions")
+        layout = QVBoxLayout(box)
+
+        self.orders_text = QTextEdit()
+        self.orders_text.setReadOnly(True)
+
+        fetch_btn = QPushButton("Fetch Orders/Positions")
+        fetch_btn.clicked.connect(self.fetch_orders_positions)
+        export_btn = QPushButton("Export Trades CSV")
+        export_btn.clicked.connect(self.export_csv)
+
+        layout.addWidget(self.orders_text)
+        layout.addWidget(fetch_btn)
+        layout.addWidget(export_btn)
+        return box
+
+    def _pnl_box(self) -> QGroupBox:
+        box = QGroupBox("P&L Dashboard")
+        layout = QVBoxLayout(box)
+        self.pnl_label = QLabel("Daily Realized P&L: 0.00")
+        layout.addWidget(self.pnl_label)
+        return box
+
+    def _strategy_changed(self, name: str) -> None:
+        self.service.current_strategy = name
+
+    def show_login_url(self) -> None:
+        try:
+            broker = ZerodhaAPI(self.api_key_input.text().strip(), self.api_secret_input.text().strip())
+            url = broker.login_url()
+            QMessageBox.information(self, "Kite Login URL", url)
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", str(exc))
+
+    def generate_access_token(self) -> None:
+        try:
+            broker = ZerodhaAPI(self.api_key_input.text().strip(), self.api_secret_input.text().strip())
+            data = broker.generate_session(self.request_token_input.text().strip())
+            token = data.get("access_token", "")
+            self.access_token_input.setText(token)
+            QMessageBox.information(self, "Success", "Access token generated. Save this securely.")
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Token generation failed: {exc}")
+
+    def connect_broker(self) -> None:
+        try:
+            broker = ZerodhaAPI(
+                self.api_key_input.text().strip(),
+                self.api_secret_input.text().strip(),
+                self.access_token_input.text().strip(),
+            )
+            profile = broker.profile()
+            self.service.set_broker(broker)
+            self.profile_label.setText(f"Connected: {profile.get('user_name')} ({profile.get('user_id')})")
+        except ZerodhaAPIError as exc:
+            QMessageBox.critical(self, "Dependency Error", str(exc))
+        except Exception as exc:
+            QMessageBox.critical(self, "Broker Error", str(exc))
+
+    def refresh_market(self) -> None:
+        if not self.service.broker:
+            return
+        try:
+            quotes = self.service.broker.get_ltp(self.symbols)
+            self.market_table.setRowCount(len(self.symbols))
+            for row, sym in enumerate(self.symbols):
+                ltp = quotes.get(sym, {}).get("last_price", 0)
+                self.market_table.setItem(row, 0, QTableWidgetItem(sym))
+                self.market_table.setItem(row, 1, QTableWidgetItem(f"{ltp:.2f}"))
+                self.market_table.setItem(row, 2, QTableWidgetItem(datetime.now().strftime("%H:%M:%S")))
+
+                # Basic strategy loop using historical data
+                instrument_dump = self.service.broker.kite.instruments("NSE")
+                token = next((x["instrument_token"] for x in instrument_dump if f"NSE:{x['tradingsymbol']}" == sym), None)
+                if token:
+                    ohlc = self.service.broker.get_historical_ohlc(token, "5minute", days=4)
+                    qty = max(1, int(self.qty_input.text().strip() or "1"))
+                    self.service.process_signal(sym, ohlc, qty)
+
+            self.pnl_label.setText(f"Daily Realized P&L: {self.service.risk.daily_realized_pnl:.2f}")
+        except Exception as exc:
+            self.logger.exception("Market refresh failed")
+            QMessageBox.warning(self, "Market Error", str(exc))
+
+    def fetch_orders_positions(self) -> None:
+        if not self.service.broker:
+            return
+        try:
+            orders = self.service.broker.orders()
+            positions = self.service.broker.positions()
+            trades = self.service.broker.trades()
+            text = f"Orders: {len(orders)}\nTrades: {len(trades)}\nPositions: {positions}"
+            self.orders_text.setPlainText(text)
+        except Exception as exc:
+            QMessageBox.warning(self, "Error", str(exc))
+
+    def export_csv(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, "Save CSV", "trades.csv", "CSV Files (*.csv)")
+        if not path:
+            return
+        out = self.service.export_trades_csv(path)
+        QMessageBox.information(self, "Exported", f"Saved to {out}")
+
+    def show_plot(self) -> None:
+        if not self.service.broker:
+            QMessageBox.warning(self, "Not connected", "Connect broker first")
+            return
+        try:
+            instrument_dump = self.service.broker.kite.instruments("NSE")
+            sym = self.symbols[2]  # RELIANCE default
+            token = next((x["instrument_token"] for x in instrument_dump if f"NSE:{x['tradingsymbol']}" == sym), None)
+            if not token:
+                return
+            ohlc = self.service.broker.get_historical_ohlc(token, "5minute", days=2)
+            fig = go.Figure(
+                data=[
+                    go.Candlestick(
+                        x=ohlc.index,
+                        open=ohlc["open"],
+                        high=ohlc["high"],
+                        low=ohlc["low"],
+                        close=ohlc["close"],
+                    )
+                ]
+            )
+            fig.update_layout(title=f"{sym} Candlestick")
+            plot(fig, filename="latest_chart.html", auto_open=True)
+        except Exception as exc:
+            QMessageBox.warning(self, "Chart Error", str(exc))
+
+    def toggle_dark_mode(self) -> None:
+        if self.dark_mode_toggle.isChecked():
+            self.setStyleSheet("QWidget { background-color: #2b2b2b; color: #f0f0f0; } QLineEdit, QTextEdit, QTableWidget { background-color: #3b3b3b; }")
+        else:
+            self.setStyleSheet("")
