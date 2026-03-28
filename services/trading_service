@@ -1,0 +1,93 @@
+"""Core trading orchestration service for live and paper mode."""
+from __future__ import annotations
+
+import csv
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from broker.zerodha_api import ZerodhaAPI
+from data.database import Database
+from strategy.engine import StrategyEngine
+from utils.alerts import TelegramAlerter
+from utils.risk import RiskManager
+
+
+class TradingService:
+    def __init__(
+        self,
+        db: Database,
+        strategy_engine: StrategyEngine,
+        risk: RiskManager,
+        logger,
+        alerter: TelegramAlerter,
+    ) -> None:
+        self.db = db
+        self.strategy_engine = strategy_engine
+        self.risk = risk
+        self.logger = logger
+        self.alerter = alerter
+
+        self.broker: ZerodhaAPI | None = None
+        self.auto_trading_enabled = False
+        self.live_mode = False
+        self.current_strategy = "EMA_CROSS_9_21"
+
+    def set_broker(self, broker: ZerodhaAPI) -> None:
+        self.broker = broker
+
+    def set_mode(self, live_mode: bool) -> None:
+        self.live_mode = live_mode
+
+    def set_auto_trading(self, enabled: bool) -> None:
+        self.auto_trading_enabled = enabled
+
+    def process_signal(self, symbol: str, ohlc, quantity: int = 1) -> dict[str, Any]:
+        decision = self.strategy_engine.evaluate(self.current_strategy, symbol, ohlc)
+        self.db.log_strategy(decision.strategy, symbol, decision.signal, f"price={decision.price}")
+
+        if decision.signal == "HOLD" or not self.auto_trading_enabled:
+            return {"status": "NO_ACTION", "signal": decision.signal}
+
+        if not self.risk.can_trade():
+            self.logger.warning("Daily max loss breached. Trading halted.")
+            return {"status": "RISK_BLOCK", "signal": decision.signal}
+
+        side = decision.signal
+        if self.live_mode and self.broker:
+            exchange, tradingsymbol = symbol.split(":", 1)
+            order_id = self.broker.place_order(
+                tradingsymbol=tradingsymbol,
+                exchange=exchange,
+                transaction_type=side,
+                quantity=quantity,
+                order_type="MARKET",
+            )
+            self.db.log_trade(symbol, side, quantity, decision.price, "LIVE", "PLACED", order_id)
+            msg = f"LIVE {side} {symbol} qty={quantity} @~{decision.price} order_id={order_id}"
+            self.logger.info(msg)
+            self.alerter.send(msg)
+            return {"status": "PLACED", "order_id": order_id, "signal": side}
+
+        # Paper trading
+        self.db.log_trade(symbol, side, quantity, decision.price, "PAPER", "SIMULATED", None)
+        msg = f"PAPER {side} {symbol} qty={quantity} @~{decision.price}"
+        self.logger.info(msg)
+        self.alerter.send(msg)
+        return {"status": "SIMULATED", "signal": side}
+
+    def export_trades_csv(self, path: str) -> str:
+        rows = self.db.fetch_trades(limit=10_000)
+        out = Path(path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with out.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["timestamp", "symbol", "side", "qty", "price", "mode", "status", "order_id", "pnl"])
+            for r in rows:
+                writer.writerow(
+                    [r["timestamp"], r["symbol"], r["side"], r["qty"], r["price"], r["mode"], r["status"], r["order_id"], r["pnl"]]
+                )
+        return str(out)
+
+    def now_iso(self) -> str:
+        return datetime.utcnow().isoformat()
