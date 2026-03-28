@@ -1,0 +1,97 @@
+"""Zerodha Kite Connect integration wrapper for market data and orders."""
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+from typing import Any
+
+import pandas as pd
+
+try:
+    from kiteconnect import KiteConnect
+except ImportError:  # handled at runtime via graceful errors
+    KiteConnect = None
+
+
+class ZerodhaAPIError(Exception):
+    """Raised when Zerodha operations fail."""
+
+
+class ZerodhaAPI:
+    """Thin service wrapper over KiteConnect for easier testing and app integration."""
+
+    def __init__(self, api_key: str, api_secret: str, access_token: str = "") -> None:
+        if KiteConnect is None:
+            raise ZerodhaAPIError("kiteconnect package not installed. Install requirements.txt first.")
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.kite = KiteConnect(api_key=api_key)
+        if access_token:
+            self.kite.set_access_token(access_token)
+
+    def login_url(self) -> str:
+        return self.kite.login_url()
+
+    def generate_session(self, request_token: str) -> dict[str, Any]:
+        data = self.kite.generate_session(request_token, api_secret=self.api_secret)
+        self.kite.set_access_token(data["access_token"])
+        return data
+
+    def set_access_token(self, token: str) -> None:
+        self.kite.set_access_token(token)
+
+    def profile(self) -> dict[str, Any]:
+        return self.kite.profile()
+
+    def get_ltp(self, instruments: list[str]) -> dict[str, dict[str, float]]:
+        return self.kite.ltp(instruments)
+
+    def get_historical_ohlc(
+        self,
+        instrument_token: int,
+        interval: str = "5minute",
+        days: int = 5,
+    ) -> pd.DataFrame:
+        to_dt = datetime.now()
+        from_dt = to_dt - timedelta(days=days)
+        candles = self.kite.historical_data(
+            instrument_token=instrument_token,
+            from_date=from_dt,
+            to_date=to_dt,
+            interval=interval,
+        )
+        frame = pd.DataFrame(candles)
+        if not frame.empty:
+            frame["date"] = pd.to_datetime(frame["date"])
+            frame.set_index("date", inplace=True)
+        return frame
+
+    def place_order(
+        self,
+        tradingsymbol: str,
+        exchange: str,
+        transaction_type: str,
+        quantity: int,
+        order_type: str = "MARKET",
+        product: str = "MIS",
+        variety: str = "regular",
+        price: float | None = None,
+    ) -> str:
+        return self.kite.place_order(
+            tradingsymbol=tradingsymbol,
+            exchange=exchange,
+            transaction_type=transaction_type,
+            quantity=quantity,
+            order_type=order_type,
+            product=product,
+            variety=variety,
+            price=price,
+        )
+
+    def orders(self) -> list[dict[str, Any]]:
+        return self.kite.orders()
+
+    def trades(self) -> list[dict[str, Any]]:
+        return self.kite.trades()
+
+    def positions(self) -> dict[str, Any]:
+        return self.kite.positions()
